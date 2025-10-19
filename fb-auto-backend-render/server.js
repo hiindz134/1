@@ -1,237 +1,77 @@
-// server.js - Render-ready backend (CommonJS)
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const crypto = require('crypto');
-const rateLimit = require('express-rate-limit').rateLimit;
-const Database = require('better-sqlite3');
-const morgan = require('morgan');
-
+// server.js
+// ✅ Backend Messenger bot: verify webhook + auto reply
+const express = require("express");
+const axios = require("axios");
+const crypto = require("crypto");
 const app = express();
-app.use(express.json());
-app.use(morgan('dev'));
-
-// CORS: allow from any by default; change to your dashboard origin if needed
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
-app.use(cors({ origin: ALLOW_ORIGIN }));
 
 const {
   PAGE_ACCESS_TOKEN,
-  VERIFY_TOKEN = 'verify_token',
-  APP_SECRET = '',
+  VERIFY_TOKEN = "verify_token",
+  APP_SECRET = "",
+  GRAPH_VERSION = "v21.0",
   PORT = 3000,
-  GRAPH_VERSION = 'v21.0',
 } = process.env;
 
-if (!PAGE_ACCESS_TOKEN) {
-  console.error('ERROR: Missing PAGE_ACCESS_TOKEN in environment.');
-  process.exit(1);
-}
-
-// ---- SQLite (Render ephemeral FS is fine; DB resets on redeploy) ----
-const db = new Database('db.sqlite');
-db.pragma('journal_mode = WAL');
-db.exec(`
-CREATE TABLE IF NOT EXISTS logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT,
-  post_id TEXT,
-  comment_id TEXT,
-  psid TEXT,
-  message TEXT,
-  status TEXT,
-  error TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-`);
-
-// ---- FB client ----
-const FB = axios.create({
-  baseURL: `https://graph.facebook.com/${GRAPH_VERSION}`,
-  params: { access_token: PAGE_ACCESS_TOKEN },
-  timeout: 30000,
-});
-
-async function* paginate(url, params = {}) {
-  let next = { url, params };
-  while (next) {
-    const { data } = await FB.get(next.url, { params: next.params });
-    if (data?.data?.length) yield data.data;
-    next = data?.paging?.next
-      ? { url: data.paging.next.replace(`https://graph.facebook.com/${GRAPH_VERSION}`, ''), params: {} }
-      : null;
+// Middleware để đọc raw body
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
   }
-}
+}));
 
-async function sendPrivateReply(commentId, message) {
-  const { data } = await FB.post(`/${commentId}/private_replies`, { message });
-  return data;
-}
-
-async function sendInbox(psid, text) {
-  const { data } = await FB.post(`/me/messages`, {
-    recipient: { id: psid },
-    message: { text },
-    messaging_type: 'RESPONSE', // valid within 24h window
-  });
-  return data;
-}
-
-function verifySignature(req) {
-  if (!APP_SECRET) return true; // skip if not provided
-  const signature = req.headers['x-hub-signature-256'];
-  if (!signature) return false;
-  const hmac = crypto.createHmac('sha256', APP_SECRET);
-  hmac.update(JSON.stringify(req.body), 'utf-8');
-  const expected = `sha256=${hmac.digest('hex')}`;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch (_) {
-    return false;
-  }
-}
-
-// ----- Rate limit your own API -----
-app.use('/api/', rateLimit({ windowMs: 60_000, limit: 120 }));
-
-// ----- Health -----
-app.get('/', (_req, res) => res.json({ ok: true, service: 'fb-auto-backend', version: '1.0.0' }));
-
-// ----- Webhook (Meta) -----
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
+// ✅ Route test để kiểm tra server sống
+app.get("/", (req, res) => {
+  res.send("Server is live ✅");
 });
 
-app.post('/webhook', (req, res) => {
-  if (!verifySignature(req)) return res.sendStatus(403);
-  const body = req.body;
-  if (body.object === 'page') {
-    for (const entry of body.entry || []) {
-      for (const event of entry.messaging || []) {
-        if (event.message && event.sender?.id) {
-          // Here you can record thread 24h if needed
-          // console.log('Incoming message from PSID:', event.sender.id);
-        }
-      }
-    }
-  }
-  res.sendStatus(200);
-});
-
-// ----- API: list comments of a post -----
-app.get('/api/posts/:postId/comments', async (req, res) => {
-  const { postId } = req.params;
-  try {
-    const out = [];
-    for await (const chunk of paginate(`/${postId}/comments`, { fields: 'id,from' })) {
-      out.push(...chunk);
-    }
-    res.json({ ok: true, data: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// ----- API: bulk private replies by postId -----
-app.post('/api/private-replies', async (req, res) => {
-  const { post_id, message } = req.body || {};
-  if (!post_id || !message) return res.status(400).json({ ok: false, error: 'post_id & message required' });
-  const results = { sent: 0, failed: 0, details: [] };
-  try {
-    for await (const chunk of paginate(`/${post_id}/comments`, { fields: 'id,from' })) {
-      for (const c of chunk) {
-        try {
-          await sendPrivateReply(c.id, message);
-          db.prepare('INSERT INTO logs (type, post_id, comment_id, message, status) VALUES (?,?,?,?,?)')
-            .run('private_reply', post_id, c.id, message, 'sent');
-          results.sent++;
-          results.details.push({ comment_id: c.id, status: 'sent' });
-          await new Promise(r => setTimeout(r, 350));
-        } catch (e) {
-          const err = e?.response?.data ? JSON.stringify(e.response.data) : String(e.message);
-          db.prepare('INSERT INTO logs (type, post_id, comment_id, message, status, error) VALUES (?,?,?,?,?,?)')
-            .run('private_reply', post_id, c.id, message, 'failed', err);
-          results.failed++;
-          results.details.push({ comment_id: c.id, status: 'failed', error: err });
-        }
-      }
-    }
-    res.json({ ok: true, sent: results.sent, failed: results.failed, details: results.details });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// ----- API: logs -----
-app.get('/api/logs', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM logs ORDER BY id DESC LIMIT 500').all();
-  res.json({ ok: true, data: rows });
-});
-
-// (Optional) API: send inbox within 24h window (uncomment to use)
-// app.post('/api/send/inbox', async (req, res) => {
-//   const { psid, text } = req.body || {};
-//   if (!psid || !text) return res.status(400).json({ ok: false, error: 'psid & text required' });
-//   try {
-//     await sendInbox(psid, text);
-//     res.json({ ok: true });
-//   } catch (e) {
-//     res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-//   }
-// });
-
-// Nếu phía trên chưa có: đảm bảo có middleware parse JSON
-app.use(express.json());
-
-// --- VERIFY WEBHOOK (GET) ---
+// ✅ Webhook xác minh từ Meta
 app.get("/webhook", (req, res) => {
-  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "verify_123";
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode && token) {
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("✅ Webhook verified");
-      return res.status(200).send(challenge); // TRẢ LẠI hub.challenge
-    }
-    return res.sendStatus(403);
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ WEBHOOK VERIFIED");
+    res.status(200).send(challenge);
+  } else {
+    console.log("❌ WEBHOOK VERIFY FAILED");
+    res.sendStatus(403);
   }
-  res.sendStatus(400);
 });
 
-// --- RECEIVE WEBHOOK EVENTS (POST) ---
-app.post("/webhook", (req, res) => {
+// ✅ Xử lý POST webhook (khi user nhắn tin vào page)
+app.post("/webhook", async (req, res) => {
   const body = req.body;
-
   if (body.object === "page") {
-    body.entry.forEach(entry => {
-      const evt = entry.messaging && entry.messaging[0];
-      if (!evt) return;
+    for (const entry of body.entry) {
+      const event = entry.messaging && entry.messaging[0];
+      if (!event) continue;
 
-      // Ví dụ log các loại sự kiện
-      if (evt.message) {
-        console.log("💬 Message:", evt.sender?.id, evt.message?.text);
-        // TODO: gửi trả lời ở đây nếu muốn
-      } else if (evt.postback) {
-        console.log("🔘 Postback:", evt.sender?.id, evt.postback?.payload);
+      const sender = event.sender.id;
+      if (event.message && event.message.text) {
+        const userMessage = event.message.text;
+        console.log("💬 TIN NHẮN:", userMessage);
+        await sendMessage(sender, `Bạn vừa nhắn: "${userMessage}"`);
       }
-    });
-    return res.sendStatus(200);
+    }
+    res.sendStatus(200);
+  } else {
+    res.sendStatus(404);
   }
-
-  res.sendStatus(404);
 });
 
-// (tuỳ chọn) route gốc để check server sống
-app.get("/", (_, res) => res.send("Server is live ✅"));
+// ✅ Hàm gửi tin nhắn lại người dùng
+async function sendMessage(psid, text) {
+  if (!PAGE_ACCESS_TOKEN) throw new Error("Thiếu PAGE_ACCESS_TOKEN!");
+  await axios.post(
+    `https://graph.facebook.com/${GRAPH_VERSION}/me/messages`,
+    { recipient: { id: psid }, message: { text } },
+    { params: { access_token: PAGE_ACCESS_TOKEN } }
+  );
+}
 
+// ✅ Chạy server
 app.listen(PORT, () => {
-  console.log(`Backend running on :${PORT}`);
+  console.log(`🚀 Backend chạy tại cổng ${PORT}`);
 });
