@@ -185,6 +185,53 @@ app.get('/api/logs', (_req, res) => {
 //   }
 // });
 
+// Nếu phía trên chưa có: đảm bảo có middleware parse JSON
+app.use(express.json());
+
+// --- VERIFY WEBHOOK (GET) ---
+app.get("/webhook", (req, res) => {
+  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "verify_123";
+
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode && token) {
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
+      console.log("✅ Webhook verified");
+      return res.status(200).send(challenge); // TRẢ LẠI hub.challenge
+    }
+    return res.sendStatus(403);
+  }
+  res.sendStatus(400);
+});
+
+// --- RECEIVE WEBHOOK EVENTS (POST) ---
+app.post("/webhook", (req, res) => {
+  const body = req.body;
+
+  if (body.object === "page") {
+    body.entry.forEach(entry => {
+      const evt = entry.messaging && entry.messaging[0];
+      if (!evt) return;
+
+      // Ví dụ log các loại sự kiện
+      if (evt.message) {
+        console.log("💬 Message:", evt.sender?.id, evt.message?.text);
+        // TODO: gửi trả lời ở đây nếu muốn
+      } else if (evt.postback) {
+        console.log("🔘 Postback:", evt.sender?.id, evt.postback?.payload);
+      }
+    });
+    return res.sendStatus(200);
+  }
+
+  res.sendStatus(404);
+});
+
+// (tuỳ chọn) route gốc để check server sống
+app.get("/", (_, res) => res.send("Server is live ✅"));
+
 app.listen(PORT, () => {
   console.log(`Backend running on :${PORT}`);
 });
